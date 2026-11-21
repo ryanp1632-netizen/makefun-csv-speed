@@ -3,7 +3,7 @@
 // pass (run() answers any case it does not take); if the file is not in a shape it reads, every case is decoded and
 // answered with run(). MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR stand in for /input and /output outside a container.
 
-import { readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 
@@ -14,7 +14,7 @@ setFlagsFromString('--no-incremental-marking --no-turbofan --single-threaded-gc'
 
 const { run, answerCases, warmUp } = (await import(new URL('./solve.js', import.meta.url).href)) as {
   run: (input: unknown) => unknown;
-  answerCases: (bytes: Buffer) => Uint8Array;
+  answerCases: (bytes: Buffer, fd?: number) => Uint8Array | null;
   warmUp: () => void;
 };
 
@@ -22,14 +22,17 @@ const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 const bytes = readFileSync(join(INPUT_DIR, 'cases.json'));
-let out: Uint8Array | string;
+const outPath = join(OUTPUT_DIR, 'answers.json');
 try {
   warmUp(); // type feedback for every branch first (see solve.js)
-  out = answerCases(bytes);
+  const fd = openSync(outPath, 'w');
+  answerCases(bytes, fd); // writes answers.json case by case
+  closeSync(fd);
 } catch {
   const cases = JSON.parse(bytes.toString('utf8')) as { id: string; input: unknown }[];
   const answers: unknown[] = [];
   for (const c of cases) answers.push(run(c.input));
-  out = JSON.stringify(answers);
+  writeFileSync(outPath, JSON.stringify(answers));
 }
-writeFileSync(join(OUTPUT_DIR, 'answers.json'), out);
+// Everything is written and closed: exit without tearing the heap down.
+process.exit(0);

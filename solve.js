@@ -2,6 +2,8 @@
 // {text, header}. Same broken-row policy, read in one left-to-right pass over char codes, each field taken as a slice
 // of the text instead of being built one character at a time.
 
+import { writeSync } from 'node:fs';
+
 const COMMA = 0;
 const LINE_BREAK = 1;
 const END = 2;
@@ -314,14 +316,18 @@ function uSpecial(i) {
   return v < 0 || v === 0x0a || v === 0x0d || v === 0x22 || v === 0x2c;
 }
 
+// The reader's position between records (readRecord keeps them in locals while it runs).
+let RQ = 0; // the next input byte
+let RLN = 1; // the line it is on
+let RW = 0; // the next output byte
+let RWIDTH = -1; // the first record's width (-1: none yet)
+let RNREC = 0; // records read
+
 // Reads the text whose JSON string body starts at ts, writing its records at o (the case's opening left as a gap).
-// Returns the index of the string's closing quote, or -1 if it bailed out (a \u escape it cannot copy). One function
-// with every position in a local: the record loop, the field loop and the scans run inline, and only the rare paths
-// (an error, a \u escape, a bigger output buffer) call out.
+// Returns the index of the string's closing quote, or -1 if it bailed out (a \u escape it cannot copy).
 function answerText(ts) {
   const b = B;
-  let q = ts; // the next input byte
-  let ln = 1; // the line q is on
+  let q = ts;
   nErr = 0;
   xl = 0;
   r0End = -1;
@@ -329,12 +335,34 @@ function answerText(ts) {
   if (b[q] === 0xef && b[q + 1] === 0xbb && b[q + 2] === 0xbf) q += 3;
   else if (b[q] === BS && b[q + 1] === LU && hexAt(q + 2) === 0xfeff) q += 6;
   growO(64);
+  gapAt = o;
+  RQ = q;
+  RLN = 1;
+  RW = o + 24;
+  RWIDTH = -1;
+  RNREC = 0;
+  for (;;) {
+    const r = readRecord();
+    if (r === 0) break;
+    if (r < 0) return -1;
+  }
+  o = RW;
+  nRecords = RNREC;
+  return RQ;
+}
+
+// Reads the next record (and any blank lines before it): 1, or 0 at the end of the text, or -1 to bail out. A call per
+// record, with every position in a local while it runs: V8 optimizes it as an ordinary hot function, with no need to
+// replace a running loop's frame (on-stack replacement). The field loop and the scans run inline, and only the rare
+// paths (an error, a \u escape, a bigger output buffer) call out.
+function readRecord() {
+  const b = B;
   let out = O;
-  let w = o;
-  gapAt = w;
-  w += 24;
-  let width = -1;
-  let nRec = 0; // records read
+  let q = RQ;
+  let ln = RLN;
+  let w = RW;
+  const width = RWIDTH;
+  const nRec = RNREC;
   for (;;) {
     // Lines with no characters are no records.
     for (;;) {
@@ -353,7 +381,12 @@ function answerText(ts) {
       }
       break;
     }
-    if (b[q] === QT) break;
+    if (b[q] === QT) {
+      RQ = q;
+      RLN = ln;
+      RW = w;
+      return 0;
+    }
 
     recLine = ln;
     recOrd = nRec;
@@ -536,12 +569,15 @@ function answerText(ts) {
     }
     if (nRec === 0) {
       // The first record: columns or rows[0], so the 9 bytes after it wait for the header flag.
-      width = count;
       out[w++] = 0x5d;
       r0End = w;
       w += 9;
-      nRec = 1;
-      continue;
+      RQ = q;
+      RLN = ln;
+      RW = w;
+      RWIDTH = count;
+      RNREC = 1;
+      return 1;
     }
     if (count < width) {
       pushErr(SHORT, count, 0);
@@ -563,11 +599,12 @@ function answerText(ts) {
       w = cutO;
     }
     out[w++] = 0x5d;
-    nRec++;
+    RQ = q;
+    RLN = ln;
+    RW = w;
+    RNREC = nRec + 1;
+    return 1;
   }
-  o = w;
-  nRecords = nRec;
-  return q;
 }
 
 // Fills in the case answerText read, now that its header flag is known, and writes its errors.
@@ -806,8 +843,12 @@ function answerInput(vs) {
   o += O.write(s, o, 'utf8');
 }
 
-/** The bytes of answers.json for the bytes of cases.json (a JSON array of {id, input}). */
-export function answerCases(bytes) {
+/**
+ * The bytes of answers.json for the bytes of cases.json (a JSON array of {id, input}). Given a file descriptor `fd`,
+ * it writes them there instead, one case at a time, reusing one output buffer (so the run touches little fresh memory),
+ * and returns null.
+ */
+export function answerCases(bytes, fd = -1) {
   B = bytes;
   N = bytes.length;
   p = 0;
@@ -842,6 +883,10 @@ export function answerCases(bytes) {
             }
             first = false;
             answerInput(p);
+            if (fd >= 0) {
+              writeSync(fd, O, 0, o);
+              o = 0;
+            }
           } else {
             skipValue();
           }
@@ -866,9 +911,12 @@ export function answerCases(bytes) {
   }
   growO(1);
   O[o++] = 0x5d;
-  const out = O.subarray(0, o);
+  let out = null;
+  if (fd >= 0) writeSync(fd, O, 0, o);
+  else out = O.subarray(0, o);
   B = null;
   X = null;
+  O = null;
   return out;
 }
 
