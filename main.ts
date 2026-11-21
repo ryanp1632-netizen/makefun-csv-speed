@@ -12,9 +12,10 @@ import { setFlagsFromString } from 'node:v8';
 // ~10 MB input. Background GC tasks off, as the sandbox has one CPU.
 setFlagsFromString('--no-incremental-marking --no-turbofan --single-threaded-gc');
 
-const { run, answerCases } = (await import(new URL('./solve.js', import.meta.url).href)) as {
+const { run, answerCases, warmUp } = (await import(new URL('./solve.js', import.meta.url).href)) as {
   run: (input: unknown) => unknown;
   answerCases: (bytes: Buffer) => Uint8Array;
+  warmUp: () => void;
 };
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
@@ -23,6 +24,7 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const bytes = readFileSync(join(INPUT_DIR, 'cases.json'));
 let out: Uint8Array | string;
 try {
+  warmUp(); // type feedback for every branch first (see solve.js)
   out = answerCases(bytes);
 } catch {
   const cases = JSON.parse(bytes.toString('utf8')) as { id: string; input: unknown }[];

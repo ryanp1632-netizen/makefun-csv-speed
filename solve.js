@@ -191,40 +191,66 @@ export function run(input) {
 // (comma, quote, CR, LF), and inside a JSON string they are spelled `,`, `\"`, `\r` and `\n`; any other byte or escape
 // is one opaque character copied as it is. A case in any shape this fast path does not expect (escaped keys, a text
 // that is not a string, a \u escape spelling one of those four characters, ...) is answered by run() instead.
+//
+// The text comes before its header flag in cases.json, and the flag changes only where the first record goes (columns
+// or rows[0]) and the row numbers of the errors. So the text is read first: the first record is written with a gap of
+// spaces before it and after it, the errors are kept as numbers, and once the flag is read the gaps are filled in
+// (JSON allows the spaces that are left) and the errors written with their row numbers.
 
 const QT = 0x22; // a raw quote: the end of the JSON string that holds the text
 const BS = 0x5c; // a backslash: an escape
 const CM = 0x2c; // a comma
+const SP = 0x20; // a space
 const LN = 0x6e; // 'n' of \n
 const LR = 0x72; // 'r' of \r
 const LU = 0x75; // 'u' of \uXXXX
 
 let B = null; // the input bytes
 let N = 0;
-let p = 0; // the next input byte
+let p = 0; // the next input byte (between the texts)
 let O = null; // the output bytes
 let o = 0;
-let E = null; // the current case's errors (the body of its errors array)
-let e = 0;
-let errCount = 0;
+
+// The current case's errors, 5 numbers each: code, line, the record's ordinal (records read before it), and for
+// short_row its field count, for long_row the extra fields' bytes [from, to) in X.
+let ER = new Int32Array(5 * 4096);
+let nErr = 0;
+let X = null;
+let xl = 0;
 let recLine = 1;
-let recRow = -1; // -1: the header (null)
+let recOrd = 0;
+
+// The current case's layout, from answerText to finishCase.
+let gapAt = 0; // the 24 bytes for the case's opening
+let r0End = -1; // the 9 bytes after the first record (-1: no record)
+let nRecords = 0;
+
+const STRAY = 0;
+const JUNK = 1;
+const UNTERM = 2;
+const SHORT = 3;
+const LONG = 4;
 
 const enc = (s) => Buffer.from(s, 'latin1');
-const ERR_STRAY = enc('{"code":"stray_cr","line":');
-const ERR_JUNK = enc('{"code":"quote_junk","line":');
-const ERR_UNTERM = enc('{"code":"unterminated_quote","line":');
-const ERR_SHORT = enc('{"code":"short_row","line":');
-const ERR_LONG = enc('{"code":"long_row","line":');
+const ERR_PREFIX = [
+  enc('{"code":"stray_cr","line":'),
+  enc('{"code":"quote_junk","line":'),
+  enc('{"code":"unterminated_quote","line":'),
+  enc('{"code":"short_row","line":'),
+  enc('{"code":"long_row","line":'),
+];
 const S_ROW = enc(',"row":');
 const S_NULL = enc('null');
 const S_FIELDS = enc(',"fields":');
 const S_EXTRA = enc(',"extra":[');
-const S_COLS = enc('{"columns":');
+const S_COLS = enc('{"columns":'); // 11 bytes
+const S_COLS_NULL_ROWS = enc('{"columns":null,"rows":['); // 24 bytes
+const S_ROWS = enc(',"rows":['); // 9 bytes
 const S_NULL_ROWS = enc('null,"rows":[');
-const S_ROWS = enc(',"rows":[');
 const S_EMPTY_ROWS = enc('[],"rows":[');
 const S_ERRS = enc('],"errors":[');
+const TEXT_KEY = enc('"text":"');
+const HEADER_KEY = enc(',"header":');
 
 function growO(need) {
   if (o + need <= O.length) return;
@@ -233,47 +259,38 @@ function growO(need) {
   O = nb;
 }
 
-function growE(need) {
-  if (e + need <= E.length) return;
-  const nb = Buffer.allocUnsafe(Math.max(E.length * 2, e + need + 65536));
-  E.copy(nb, 0, 0, e);
-  E = nb;
+function putO(s) {
+  s.copy(O, o);
+  o += s.length;
 }
 
-function putE(s) {
-  s.copy(E, e);
-  e += s.length;
-}
-
-function intE(v) {
+function intO(v) {
   if (v < 10) {
-    E[e++] = 48 + v;
+    O[o++] = 48 + v;
     return;
   }
   let len = 1;
   for (let t = v; t >= 10; t = (t / 10) | 0) len++;
-  let i = e + len;
-  e = i;
+  let i = o + len;
+  o = i;
   do {
-    E[--i] = 48 + (v % 10);
+    O[--i] = 48 + (v % 10);
     v = (v / 10) | 0;
   } while (v > 0);
 }
 
-// Opens an error record of `prefix` for the current record: {"code":…,"line":L,"row":R (left open for extra keys).
-function openErr(prefix) {
-  growE(96);
-  if (errCount++ > 0) E[e++] = CM;
-  putE(prefix);
-  intE(recLine);
-  putE(S_ROW);
-  if (recRow < 0) putE(S_NULL);
-  else intE(recRow);
-}
-
-function simpleErr(prefix) {
-  openErr(prefix);
-  E[e++] = 0x7d;
+function pushErr(code, a, b) {
+  if (5 * nErr + 5 > ER.length) {
+    const na = new Int32Array(ER.length * 2);
+    na.set(ER);
+    ER = na;
+  }
+  const i = 5 * nErr++;
+  ER[i] = code;
+  ER[i + 1] = recLine;
+  ER[i + 2] = recOrd;
+  ER[i + 3] = a;
+  ER[i + 4] = b;
 }
 
 function hexAt(i) {
@@ -297,36 +314,27 @@ function uSpecial(i) {
   return v < 0 || v === 0x0a || v === 0x0d || v === 0x22 || v === 0x2c;
 }
 
-function putO(s) {
-  s.copy(O, o);
-  o += s.length;
-}
-
-// Answers one case whose text is the JSON string body starting at ts (its closing quote at te). False: bailed out.
-// One function with every position in a local: the record loop, the field loop and the scans run inline, and only
-// the rare paths (an error record, a \u escape, a bigger output buffer) call out.
-function answerText(ts, te, header) {
+// Reads the text whose JSON string body starts at ts, writing its records at o (the case's opening left as a gap).
+// Returns the index of the string's closing quote, or -1 if it bailed out (a \u escape it cannot copy). One function
+// with every position in a local: the record loop, the field loop and the scans run inline, and only the rare paths
+// (an error, a \u escape, a bigger output buffer) call out.
+function answerText(ts) {
   const b = B;
-  let out = O;
   let q = ts; // the next input byte
-  let w = o; // the next output byte
   let ln = 1; // the line q is on
-  e = 0;
-  errCount = 0;
+  nErr = 0;
+  xl = 0;
+  r0End = -1;
+  nRecords = 0;
   if (b[q] === 0xef && b[q + 1] === 0xbb && b[q + 2] === 0xbf) q += 3;
   else if (b[q] === BS && b[q + 1] === LU && hexAt(q + 2) === 0xfeff) q += 6;
-  o = w;
   growO(64);
-  out = O;
-  S_COLS.copy(out, w);
-  w += S_COLS.length;
-  if (!header) {
-    S_NULL_ROWS.copy(out, w);
-    w += S_NULL_ROWS.length;
-  }
-  let haveCols = !header;
+  let out = O;
+  let w = o;
+  gapAt = w;
+  w += 24;
   let width = -1;
-  let rowCount = 0;
+  let nRec = 0; // records read
   for (;;) {
     // Lines with no characters are no records.
     for (;;) {
@@ -345,22 +353,18 @@ function answerText(ts, te, header) {
       }
       break;
     }
-    if (b[q] === QT) {
-      if (q !== te) return false; // te was a guess, and not this string's end
-      break;
-    }
+    if (b[q] === QT) break;
 
     recLine = ln;
-    const isHeader = !haveCols;
-    recRow = isHeader ? -1 : rowCount;
-    const need = 3 * (te - q) + 4 * (width > 0 ? width : 0) + 256;
+    recOrd = nRec;
+    const need = 3 * (N - q) + 4 * (width > 0 ? width : 0) + 256;
     if (w + need > out.length) {
       o = w;
       growO(need);
       out = O;
     }
     const recO = w;
-    if (!isHeader && rowCount > 0) out[w++] = CM;
+    if (nRec >= 2) out[w++] = CM;
     out[w++] = 0x5b;
     let count = 0;
     let cutO = -1;
@@ -369,7 +373,7 @@ function answerText(ts, te, header) {
     let ended = END;
     for (;;) {
       if (count > 0) {
-        if (count === width && !isHeader) cutO = w;
+        if (count === width) cutO = w;
         out[w++] = CM;
       }
       out[w++] = QT;
@@ -414,7 +418,7 @@ function answerText(ts, te, header) {
               continue;
             }
             if (x === LU) {
-              if (uSpecial(q)) return false;
+              if (uSpecial(q)) return -1;
               out[w] = BS;
               out[w + 1] = LU;
               out[w + 2] = b[q + 2];
@@ -438,7 +442,7 @@ function answerText(ts, te, header) {
           q = openQ + 2;
           ln = openLn;
           w = fs;
-          simpleErr(ERR_UNTERM);
+          pushErr(UNTERM, 0, 0);
           out[w++] = BS;
           out[w++] = QT;
         } else {
@@ -493,12 +497,12 @@ function answerText(ts, te, header) {
                 ended = LINE_BREAK;
                 break;
               }
-              simpleErr(ERR_STRAY);
+              pushErr(STRAY, 0, 0);
               q += 2;
               continue;
             }
             if (x === LU) {
-              if (uSpecial(q)) return false;
+              if (uSpecial(q)) return -1;
               out[w] = BS;
               out[w + 1] = LU;
               out[w + 2] = b[q + 2];
@@ -517,7 +521,7 @@ function answerText(ts, te, header) {
           out[w++] = c;
           q++;
         }
-        if (junk && w > w0) simpleErr(ERR_JUNK);
+        if (junk && w > w0) pushErr(JUNK, 0, 0);
       }
       if (count === 0) firstEmpty = w === fs;
       out[w++] = QT;
@@ -530,47 +534,88 @@ function answerText(ts, te, header) {
       w = recO;
       continue;
     }
-    if (width < 0) width = count;
-    if (isHeader) {
+    if (nRec === 0) {
+      // The first record: columns or rows[0], so the 9 bytes after it wait for the header flag.
+      width = count;
       out[w++] = 0x5d;
-      S_ROWS.copy(out, w);
-      w += S_ROWS.length;
-      haveCols = true;
+      r0End = w;
+      w += 9;
+      nRec = 1;
       continue;
     }
     if (count < width) {
-      openErr(ERR_SHORT);
-      putE(S_FIELDS);
-      intE(count);
-      E[e++] = 0x7d;
+      pushErr(SHORT, count, 0);
       for (let k = count; k < width; k++) {
         out[w++] = CM;
         out[w++] = QT;
         out[w++] = QT;
       }
     } else if (count > width) {
-      openErr(ERR_LONG);
       const len = w - (cutO + 1);
-      growE(len + 16);
-      putE(S_EXTRA);
-      out.copy(E, e, cutO + 1, w);
-      e += len;
-      E[e++] = 0x5d;
-      E[e++] = 0x7d;
+      if (xl + len > X.length) {
+        const nx = Buffer.allocUnsafe(Math.max(X.length * 2, xl + len + 65536));
+        X.copy(nx, 0, 0, xl);
+        X = nx;
+      }
+      out.copy(X, xl, cutO + 1, w);
+      pushErr(LONG, xl, xl + len);
+      xl += len;
       w = cutO;
     }
     out[w++] = 0x5d;
-    rowCount++;
+    nRec++;
   }
   o = w;
-  growO(e + 64);
-  if (!haveCols) putO(S_EMPTY_ROWS);
+  nRecords = nRec;
+  return q;
+}
+
+// Fills in the case answerText read, now that its header flag is known, and writes its errors.
+function finishCase(header) {
+  const g = gapAt;
+  if (nRecords === 0) {
+    o = g;
+    growO(32);
+    putO(S_COLS);
+    putO(header ? S_EMPTY_ROWS : S_NULL_ROWS);
+  } else if (header) {
+    O.fill(SP, g, g + 13);
+    S_COLS.copy(O, g + 13);
+    S_ROWS.copy(O, r0End);
+  } else {
+    S_COLS_NULL_ROWS.copy(O, g);
+    if (nRecords > 1) {
+      O[r0End] = CM;
+      O.fill(SP, r0End + 1, r0End + 9);
+    } else {
+      O.fill(SP, r0End, r0End + 9);
+    }
+  }
+  growO(nErr * 100 + xl + 64);
   putO(S_ERRS);
-  E.copy(O, o, 0, e);
-  o += e;
+  for (let i = 0; i < nErr; i++) {
+    const k = 5 * i;
+    if (i > 0) O[o++] = CM;
+    const code = ER[k];
+    putO(ERR_PREFIX[code]);
+    intO(ER[k + 1]);
+    putO(S_ROW);
+    const row = header ? ER[k + 2] - 1 : ER[k + 2];
+    if (row < 0) putO(S_NULL);
+    else intO(row);
+    if (code === SHORT) {
+      putO(S_FIELDS);
+      intO(ER[k + 3]);
+    } else if (code === LONG) {
+      putO(S_EXTRA);
+      X.copy(O, o, ER[k + 3], ER[k + 4]);
+      o += ER[k + 4] - ER[k + 3];
+      O[o++] = 0x5d;
+    }
+    O[o++] = 0x7d;
+  }
   O[o++] = 0x5d;
   O[o++] = 0x7d;
-  return true;
 }
 
 // ---- the JSON around the texts ----
@@ -642,9 +687,6 @@ function keyIs(ks, ke, word) {
   return true;
 }
 
-const NEEDLE = enc(',"header":');
-const TEXT_KEY = enc('"text":"');
-
 // Whether the bytes at i spell `s` (a Buffer).
 function bytesAt(i, s) {
   for (let k = 0; k < s.length; k++) if (B[i + k] !== s[k]) return false;
@@ -657,31 +699,31 @@ function answerInput(vs) {
   p = vs;
   skipWs();
   const os = p;
-  // The generator's shape, {"text":"…","header":true|false}: the text's closing quote is found with one search. Inside
-  // a JSON string every quote is escaped, so a `,"header":` there would be followed by a bare word, never valid JSON:
-  // the first one after the text's opening quote lies outside it, and the text ends just before it when it is the
-  // next key. answerText checks that guess at the string's real end and bails out if it was wrong.
+  // The generator's shape, {"text":"…","header":true|false}: the text is read first, up to its closing quote.
   if (B[os] === 0x7b && bytesAt(os + 1, TEXT_KEY)) {
-    const ts = os + 1 + TEXT_KEY.length;
-    const j = B.indexOf(NEEDLE, ts);
-    if (j > 0 && B[j - 1] === QT) {
-      let r = j + NEEDLE.length;
+    const te = answerText(os + 1 + TEXT_KEY.length);
+    if (te >= 0) {
+      let r = te + 1;
       let header = -1;
-      if (keyIs(r, r + 4, 'true')) {
-        header = 1;
-        r += 4;
-      } else if (keyIs(r, r + 5, 'false')) {
+      if (B[r] === 0x7d) {
         header = 0;
-        r += 5;
+      } else if (bytesAt(r, HEADER_KEY)) {
+        r += HEADER_KEY.length;
+        if (keyIs(r, r + 4, 'true')) {
+          header = 1;
+          r += 4;
+        } else if (keyIs(r, r + 5, 'false')) {
+          header = 0;
+          r += 5;
+        }
       }
       if (header >= 0 && B[r] === 0x7d) {
-        if (answerText(ts, j - 1, header === 1)) {
-          p = r + 1;
-          return;
-        }
-        o = caseO;
+        finishCase(header === 1);
+        p = r + 1;
+        return;
       }
     }
+    o = caseO;
   }
   // Any other object of a string "text" and, if any, a literal true or false "header".
   p = os;
@@ -749,7 +791,8 @@ function answerInput(vs) {
   }
   if (ok) {
     const after = p;
-    if (answerText(ts, te, header)) {
+    if (answerText(ts) === te) {
+      finishCase(header);
       p = after;
       return;
     }
@@ -770,7 +813,7 @@ export function answerCases(bytes) {
   p = 0;
   O = Buffer.allocUnsafe(3 * N + (1 << 20));
   o = 0;
-  E = Buffer.allocUnsafe(1 << 20);
+  X = Buffer.allocUnsafe(1 << 16);
   expect(0x5b);
   O[o++] = 0x5b;
   skipWs();
@@ -825,6 +868,29 @@ export function answerCases(bytes) {
   O[o++] = 0x5d;
   const out = O.subarray(0, o);
   B = null;
-  E = null;
+  X = null;
   return out;
+}
+
+// A few small texts that take every path of the reader (a BOM, doubled quotes, CR, LF and CRLF inside quotes, stray
+// CRs, quote junk, short and long rows, blank and CR-only lines, escapes, an unterminated quote), with and without a
+// header. Reading them first gives V8 type feedback for every branch before the real input, so the optimized loop it
+// compiles while reading the first big text does not have to bail out and be compiled again at each rare branch.
+function warmText(k) {
+  let t = k === 0 ? '﻿' : '';
+  t += 'a,b,c\r\n';
+  for (let i = 0; i < 12; i++) {
+    t += `${i},"q""x${i}",3\r\n"multi\r\nline","lone\rcr","lf\nin"\nx\ry,${i},3\n"j"unk,2,3\n"j"\r,2,3\n1,2\n`;
+    t += `1,2,3,4,"5""x"\n\n\r\n\r\r\na\tb,é,東\nback\\slash,"q,uote",x"y\n"\u0001",\ud800,c\n"ok"\n1,2,3\r\n`;
+  }
+  return t + (k === 1 ? '"unterminated,x,y\ntail,a,b' : 'end,a,"b"');
+}
+
+/** Runs answerCases on the warm-up texts (its output is thrown away). */
+export function warmUp() {
+  const cases = [];
+  for (let k = 0; k < 3; k++) cases.push({ id: `w-${k}`, input: { text: warmText(k), header: k !== 1 } });
+  cases.push({ id: 'w-3', input: { text: '', header: true } });
+  cases.push({ id: 'w-4', input: { text: 'x', header: false } });
+  answerCases(Buffer.from(JSON.stringify(cases), 'utf8'));
 }
