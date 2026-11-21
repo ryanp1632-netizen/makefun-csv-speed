@@ -2,7 +2,7 @@
 // {text, header}. Same broken-row policy, read in one left-to-right pass over char codes, each field taken as a slice
 // of the text instead of being built one character at a time.
 
-import { writeSync } from 'node:fs';
+import { closeSync, fstatSync, openSync, readSync, writeSync } from 'node:fs';
 
 const COMMA = 0;
 const LINE_BREAK = 1;
@@ -219,6 +219,14 @@ let ER = new Int32Array(5 * 4096);
 let nErr = 0;
 let X = null;
 let xl = 0;
+let XBASE = 0; // where X's extra bytes start (0, or XB when X is WebAssembly memory)
+let JX = null; // the JavaScript reader's own extra-bytes buffer and error records
+let JER = ER;
+let OBASE = 0; // where the output starts in O
+let WOUT = null; // O when it is WebAssembly memory
+let WER = null; // the error records in WebAssembly memory
+const ERRCAP = 1 << 22;
+const XCAP = 1 << 22;
 let recLine = 1;
 let recOrd = 0;
 
@@ -286,6 +294,7 @@ function pushErr(code, a, b) {
     const na = new Int32Array(ER.length * 2);
     na.set(ER);
     ER = na;
+    if (WER === null || ER !== WER) JER = na;
   }
   const i = 5 * nErr++;
   ER[i] = code;
@@ -329,13 +338,34 @@ function answerText(ts) {
   const b = B;
   let q = ts;
   nErr = 0;
-  xl = 0;
   r0End = -1;
   nRecords = 0;
   if (b[q] === 0xef && b[q + 1] === 0xbb && b[q + 2] === 0xbf) q += 3;
   else if (b[q] === BS && b[q + 1] === LU && hexAt(q + 2) === 0xfeff) q += 6;
   growO(64);
   gapAt = o;
+  if (WX !== null && O === WOUT) {
+    WX.err.value = ERRB;
+    WX.x.value = XB;
+    WX.r0.value = -1;
+    const r = WX.text(q, o + 24, MEMEND, ERRB + ERRCAP, XB + XCAP, N);
+    if (r >= 0) {
+      o = WX.out.value;
+      nRecords = WX.nrec.value;
+      r0End = WX.r0.value;
+      nErr = (WX.err.value - ERRB) / 20;
+      ER = WER;
+      X = WOUT;
+      xl = WX.x.value;
+      XBASE = XB;
+      return r;
+    }
+  }
+  // The JavaScript reader (no WebAssembly, or a case it handed back).
+  ER = JER;
+  X = JX;
+  xl = 0;
+  XBASE = 0;
   RQ = q;
   RLN = 1;
   RW = o + 24;
@@ -594,6 +624,7 @@ function readRecord() {
         const nx = Buffer.allocUnsafe(Math.max(X.length * 2, xl + len + 65536));
         X.copy(nx, 0, 0, xl);
         X = nx;
+        JX = nx;
       }
       out.copy(X, xl, cutO + 1, w);
       pushErr(LONG, xl, xl + len);
@@ -630,7 +661,7 @@ function finishCase(header) {
       O.fill(SP, r0End, r0End + 9);
     }
   }
-  growO(nErr * 100 + xl + 64);
+  growO(nErr * 100 + (xl - XBASE) + 64);
   putO(S_ERRS);
   for (let i = 0; i < nErr; i++) {
     const k = 5 * i;
@@ -850,13 +881,25 @@ function answerInput(vs) {
  * it writes them there instead, one case at a time, reusing one output buffer (so the run touches little fresh memory),
  * and returns null.
  */
-export function answerCases(bytes, fd = -1) {
+export function answerCases(bytes, fd = -1, mem = null) {
   B = bytes;
   N = bytes.length;
   p = 0;
-  O = Buffer.allocUnsafe(3 * N + (1 << 20));
-  o = 0;
-  X = Buffer.allocUnsafe(1 << 16);
+  JX = Buffer.allocUnsafe(1 << 16);
+  X = JX;
+  if (mem !== null) {
+    // WebAssembly memory (answerFile): the output goes to its last region.
+    O = mem;
+    OBASE = OUTB;
+    WOUT = mem;
+    WER = new Int32Array(mem.buffer, ERRB, ERRCAP >> 2);
+  } else {
+    O = Buffer.allocUnsafe(3 * N + (1 << 20));
+    OBASE = 0;
+    WOUT = null;
+    WER = null;
+  }
+  o = OBASE;
   expect(0x5b);
   O[o++] = 0x5b;
   skipWs();
@@ -886,8 +929,8 @@ export function answerCases(bytes, fd = -1) {
             first = false;
             answerInput(p);
             if (fd >= 0) {
-              writeSync(fd, O, 0, o);
-              o = 0;
+              writeSync(fd, O, OBASE, o - OBASE);
+              o = OBASE;
             }
           } else {
             skipValue();
@@ -914,11 +957,14 @@ export function answerCases(bytes, fd = -1) {
   growO(1);
   O[o++] = 0x5d;
   let out = null;
-  if (fd >= 0) writeSync(fd, O, 0, o);
-  else out = O.subarray(0, o);
+  if (fd >= 0) writeSync(fd, O, OBASE, o - OBASE);
+  else out = Buffer.from(O.subarray(OBASE, o));
   B = null;
   X = null;
+  JX = null;
   O = null;
+  WOUT = null;
+  WER = null;
   return out;
 }
 
@@ -943,4 +989,784 @@ export function warmUp() {
   cases.push({ id: 'w-3', input: { text: '', header: true } });
   cases.push({ id: 'w-4', input: { text: 'x', header: false } });
   answerCases(Buffer.from(JSON.stringify(cases), 'utf8'));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The record loop again, as a WebAssembly function (built here from its bytes, so there is no binary in the repository
+// and nothing to install). It is the same reader as readRecord, line for line, with one addition: runs of ordinary bytes
+// are copied 16 at a time with SIMD (load 16 bytes, find the first comma, quote or backslash with three compares and a
+// bitmask, store all 16, advance to it). WebAssembly needs no warm-up: it is compiled before it runs, so the first byte
+// of the first case already goes through compiled code.
+//
+// Memory: [0, N) the input (cases.json, read straight into it) and 64 spare bytes, then the error records, then the long
+// rows' extra fields, then the output. text(q, w, lim, errEnd, xEnd, n) reads one text from q (after any BOM) writing
+// its records from w; it returns the index of the text's closing quote, -1 to hand the case to the JavaScript reader
+// (a \u00XX escape), or -2 when a region is too small (the JavaScript reader takes the case too). It leaves the output's
+// end, the first record's end, the record count, the error records' end and the extra bytes' end in its globals.
+
+const W_OUT = 0; // globals
+const W_R0 = 1;
+const W_NREC = 2;
+const W_ERR = 3;
+const W_X = 4;
+
+function wasmText() {
+  const u = (n) => {
+    const r = [];
+    do {
+      let b = n & 0x7f;
+      n >>>= 7;
+      if (n !== 0) b |= 0x80;
+      r.push(b);
+    } while (n !== 0);
+    return r;
+  };
+  const s = (n) => {
+    const r = [];
+    for (;;) {
+      const b = n & 0x7f;
+      n >>= 7;
+      if ((n === 0 && (b & 0x40) === 0) || (n === -1 && (b & 0x40) !== 0)) {
+        r.push(b);
+        return r;
+      }
+      r.push(b | 0x80);
+    }
+  };
+  const I32 = 0x7f;
+  const V128 = 0x7b;
+  // locals: 0..5 params, then these
+  const P_Q = 0, P_W = 1, P_LIM = 2, P_ERREND = 3, P_XEND = 4, P_N = 5;
+  const names = ['q', 'w', 'ln', 'width', 'nrec', 'count', 'cut', 'quoted', 'firstEmpty', 'ended', 'fs', 'c', 'x',
+    'unq', 'junk', 'w0', 'recO', 'openQ', 'openLn', 'closed', 'bits', 'e', 'xl', 'k', 'len', 'recLine', 'recOrd', 'n'];
+  const L = {};
+  names.forEach((nm, i) => (L[nm] = 6 + i));
+  const VC = 6 + names.length; // v128 locals
+  const VQ = VC + 1;
+  const VB = VC + 2;
+  const VV = VC + 3;
+
+  const code = [];
+  const op = (...b) => code.push(...b);
+  const get = (i) => op(0x20, ...u(i));
+  const set = (i) => op(0x21, ...u(i));
+  const gset = (i) => op(0x24, ...u(i));
+  const c32 = (v) => op(0x41, ...s(v));
+  const add = () => op(0x6a);
+  const sub = () => op(0x6b);
+  const mul = () => op(0x6c);
+  const eq = () => op(0x46);
+  const ne = () => op(0x47);
+  const and = () => op(0x71);
+  const ltS = () => op(0x48);
+  const gtS = () => op(0x4a);
+  const geS = () => op(0x4e);
+  const ld8 = (off = 0) => op(0x2d, 0x00, ...u(off));
+  const st8 = (off = 0) => op(0x3a, 0x00, ...u(off));
+  const st32 = (off = 0) => op(0x36, 0x02, ...u(off));
+  const blk = () => op(0x02, 0x40);
+  const lp = () => op(0x03, 0x40);
+  const iff = () => op(0x04, 0x40);
+  const els = () => op(0x05);
+  const end = () => op(0x0b);
+  const br = (d) => op(0x0c, ...u(d));
+  const brIf = (d) => op(0x0d, ...u(d));
+  const ret = () => op(0x0f);
+  const inc = (i, by) => {
+    get(i);
+    c32(by);
+    add();
+    set(i);
+  };
+  // byte at local i + off
+  const byteAt = (i, off) => {
+    get(i);
+    ld8(off);
+  };
+  // out[w + off] = v
+  const put = (off, v) => {
+    get(L.w);
+    c32(v);
+    st8(off);
+  };
+  const putLocal = (off, li) => {
+    get(L.w);
+    get(li);
+    st8(off);
+  };
+  // pushErr(code, a from local or const, b)
+  const pushErr = (codeNum, aLocal = -1, bLocal = -1) => {
+    // if (e + 20 > errEnd) return -2
+    get(L.e);
+    c32(20);
+    add();
+    get(P_ERREND);
+    gtS();
+    iff();
+    c32(-2);
+    ret();
+    end();
+    get(L.e);
+    c32(codeNum);
+    st32(0);
+    get(L.e);
+    get(L.recLine);
+    st32(4);
+    get(L.e);
+    get(L.recOrd);
+    st32(8);
+    get(L.e);
+    if (aLocal >= 0) get(aLocal);
+    else c32(0);
+    st32(12);
+    get(L.e);
+    if (bLocal >= 0) get(bLocal);
+    else c32(0);
+    st32(16);
+    inc(L.e, 20);
+  };
+  // SIMD run copy: while the 16 bytes at q hold none of the specials, copy them; then copy up to the first special.
+  const simdRun = (withComma) => {
+    lp(); // depth 0
+    get(L.q);
+    op(0xfd, 0x00, 0x00, 0x00); // v128.load align=0 offset=0
+    set(VV);
+    get(VV);
+    get(VQ);
+    op(0xfd, ...u(35)); // i8x16.eq
+    get(VV);
+    get(VB);
+    op(0xfd, ...u(35));
+    op(0xfd, ...u(80)); // v128.or
+    if (withComma) {
+      get(VV);
+      get(VC);
+      op(0xfd, ...u(35));
+      op(0xfd, ...u(80));
+    }
+    op(0xfd, ...u(100)); // i8x16.bitmask
+    set(L.bits);
+    get(L.w);
+    get(VV);
+    op(0xfd, ...u(11), 0x00, 0x00); // v128.store
+    get(L.bits);
+    op(0x45); // i32.eqz
+    iff();
+    inc(L.q, 16);
+    inc(L.w, 16);
+    br(1);
+    end();
+    end();
+    get(L.bits);
+    op(0x68); // i32.ctz
+    set(L.n);
+    get(L.q);
+    get(L.n);
+    add();
+    set(L.q);
+    get(L.w);
+    get(L.n);
+    add();
+    set(L.w);
+  };
+  // \u escape at q: return -1 for \u00XX, else copy the 6 bytes
+  const uEscape = () => {
+    byteAt(L.q, 2);
+    c32(0x30);
+    eq();
+    byteAt(L.q, 3);
+    c32(0x30);
+    eq();
+    and();
+    iff();
+    c32(-1);
+    ret();
+    end();
+    for (let k = 0; k < 6; k++) {
+      get(L.w);
+      byteAt(L.q, k);
+      st8(k);
+    }
+    inc(L.w, 6);
+    inc(L.q, 6);
+  };
+
+  // ---- body ----
+  get(P_Q);
+  set(L.q);
+  get(P_W);
+  set(L.w);
+  c32(1);
+  set(L.ln);
+  c32(-1);
+  set(L.width);
+  c32(0);
+  set(L.nrec);
+  op(0x23, ...u(W_ERR)); // e and xl start where JS put them (globals)
+  set(L.e);
+  op(0x23, ...u(W_X));
+  set(L.xl);
+  c32(0x2c);
+  op(0xfd, ...u(15)); // i8x16.splat
+  set(VC);
+  c32(0x22);
+  op(0xfd, ...u(15));
+  set(VQ);
+  c32(0x5c);
+  op(0xfd, ...u(15));
+  set(VB);
+
+  blk(); // $done (depth for 'break out of records')
+  lp(); // $R
+  // blank lines
+  lp(); // $BL
+  byteAt(L.q, 0);
+  c32(0x5c);
+  eq();
+  iff();
+  byteAt(L.q, 1);
+  set(L.x);
+  get(L.x);
+  c32(0x6e);
+  eq();
+  iff();
+  inc(L.q, 2);
+  inc(L.ln, 1);
+  br(2); // to $BL
+  end();
+  get(L.x);
+  c32(0x72);
+  eq();
+  byteAt(L.q, 2);
+  c32(0x5c);
+  eq();
+  and();
+  byteAt(L.q, 3);
+  c32(0x6e);
+  eq();
+  and();
+  iff();
+  inc(L.q, 4);
+  inc(L.ln, 1);
+  br(2);
+  end();
+  end();
+  end(); // $BL
+  byteAt(L.q, 0);
+  c32(0x22);
+  eq();
+  brIf(1); // to $done
+  get(L.ln);
+  set(L.recLine);
+  get(L.nrec);
+  set(L.recOrd);
+  // room: lim - w < 3*(n - q) + 3*max(width,0) + 64 -> -2
+  get(P_LIM);
+  get(L.w);
+  sub();
+  get(P_N);
+  get(L.q);
+  sub();
+  c32(3);
+  mul();
+  get(L.width);
+  c32(0);
+  get(L.width);
+  c32(0);
+  gtS();
+  op(0x1b); // select(width, 0, width>0)
+  c32(3);
+  mul();
+  add();
+  c32(64);
+  add();
+  ltS();
+  iff();
+  c32(-2);
+  ret();
+  end();
+  get(L.w);
+  set(L.recO);
+  get(L.nrec);
+  c32(2);
+  geS();
+  iff();
+  put(0, 0x2c);
+  inc(L.w, 1);
+  end();
+  put(0, 0x5b);
+  inc(L.w, 1);
+  c32(0);
+  set(L.count);
+  c32(-1);
+  set(L.cut);
+  c32(0);
+  set(L.firstEmpty);
+  // fields
+  lp(); // $F
+  get(L.count);
+  c32(0);
+  gtS();
+  iff();
+  get(L.count);
+  get(L.width);
+  eq();
+  iff();
+  get(L.w);
+  set(L.cut);
+  end();
+  put(0, 0x2c);
+  inc(L.w, 1);
+  end();
+  put(0, 0x22);
+  inc(L.w, 1);
+  get(L.w);
+  set(L.fs);
+  c32(1);
+  set(L.unq);
+  c32(0);
+  set(L.junk);
+  byteAt(L.q, 0);
+  c32(0x5c);
+  eq();
+  byteAt(L.q, 1);
+  c32(0x22);
+  eq();
+  and();
+  set(L.quoted);
+  get(L.quoted);
+  iff(); // quoted
+  get(L.q);
+  set(L.openQ);
+  get(L.ln);
+  set(L.openLn);
+  inc(L.q, 2);
+  c32(0);
+  set(L.closed);
+  blk(); // $qdone
+  lp(); // $ql
+  simdRun(false);
+  byteAt(L.q, 0);
+  c32(0x22);
+  eq();
+  brIf(1); // unclosed: end of text
+  byteAt(L.q, 1);
+  set(L.x);
+  get(L.x);
+  c32(0x22);
+  eq();
+  iff();
+  byteAt(L.q, 2);
+  c32(0x5c);
+  eq();
+  byteAt(L.q, 3);
+  c32(0x22);
+  eq();
+  and();
+  iff();
+  put(0, 0x5c);
+  put(1, 0x22);
+  inc(L.w, 2);
+  inc(L.q, 4);
+  br(2); // $ql
+  end();
+  inc(L.q, 2);
+  c32(1);
+  set(L.closed);
+  br(2); // $qdone (if depth 1, $ql 2, $qdone... ) -- see note below
+  end();
+  get(L.x);
+  c32(0x72);
+  eq();
+  iff();
+  put(0, 0x5c);
+  put(1, 0x6e);
+  inc(L.w, 2);
+  inc(L.ln, 1);
+  inc(L.q, 2);
+  byteAt(L.q, 0);
+  c32(0x5c);
+  eq();
+  byteAt(L.q, 1);
+  c32(0x6e);
+  eq();
+  and();
+  iff();
+  inc(L.q, 2);
+  end();
+  br(1); // $ql
+  end();
+  get(L.x);
+  c32(0x6e);
+  eq();
+  iff();
+  put(0, 0x5c);
+  put(1, 0x6e);
+  inc(L.w, 2);
+  inc(L.ln, 1);
+  inc(L.q, 2);
+  br(1);
+  end();
+  get(L.x);
+  c32(0x75);
+  eq();
+  iff();
+  uEscape();
+  br(1);
+  end();
+  put(0, 0x5c);
+  putLocal(1, L.x);
+  inc(L.w, 2);
+  inc(L.q, 2);
+  br(0); // $ql
+  end(); // $ql
+  end(); // $qdone
+  get(L.closed);
+  op(0x45);
+  iff(); // unclosed
+  get(L.openQ);
+  c32(2);
+  add();
+  set(L.q);
+  get(L.openLn);
+  set(L.ln);
+  get(L.fs);
+  set(L.w);
+  pushErr(UNTERM);
+  put(0, 0x5c);
+  put(1, 0x22);
+  inc(L.w, 2);
+  els(); // closed: what follows the closing quote
+  byteAt(L.q, 0);
+  set(L.c);
+  get(L.c);
+  c32(0x22);
+  eq();
+  iff();
+  c32(0);
+  set(L.unq);
+  c32(END);
+  set(L.ended);
+  els();
+  get(L.c);
+  c32(0x2c);
+  eq();
+  iff();
+  inc(L.q, 1);
+  c32(0);
+  set(L.unq);
+  c32(COMMA);
+  set(L.ended);
+  els();
+  get(L.c);
+  c32(0x5c);
+  eq();
+  byteAt(L.q, 1);
+  c32(0x6e);
+  eq();
+  and();
+  iff();
+  inc(L.q, 2);
+  inc(L.ln, 1);
+  c32(0);
+  set(L.unq);
+  c32(LINE_BREAK);
+  set(L.ended);
+  els();
+  get(L.c);
+  c32(0x5c);
+  eq();
+  byteAt(L.q, 1);
+  c32(0x72);
+  eq();
+  and();
+  byteAt(L.q, 2);
+  c32(0x5c);
+  eq();
+  and();
+  byteAt(L.q, 3);
+  c32(0x6e);
+  eq();
+  and();
+  iff();
+  inc(L.q, 4);
+  inc(L.ln, 1);
+  c32(0);
+  set(L.unq);
+  c32(LINE_BREAK);
+  set(L.ended);
+  els();
+  c32(1);
+  set(L.junk);
+  end();
+  end();
+  end();
+  end();
+  end(); // unclosed/closed
+  end(); // quoted
+  get(L.unq);
+  iff(); // unquoted scan
+  get(L.w);
+  set(L.w0);
+  c32(END);
+  set(L.ended);
+  blk(); // $udone
+  lp(); // $ul
+  simdRun(true);
+  byteAt(L.q, 0);
+  set(L.c);
+  get(L.c);
+  c32(0x2c);
+  eq();
+  iff();
+  inc(L.q, 1);
+  c32(COMMA);
+  set(L.ended);
+  br(2); // $udone
+  end();
+  get(L.c);
+  c32(0x22);
+  eq();
+  brIf(1); // $udone
+  byteAt(L.q, 1);
+  set(L.x);
+  get(L.x);
+  c32(0x6e);
+  eq();
+  iff();
+  inc(L.q, 2);
+  inc(L.ln, 1);
+  c32(LINE_BREAK);
+  set(L.ended);
+  br(2);
+  end();
+  get(L.x);
+  c32(0x72);
+  eq();
+  iff();
+  byteAt(L.q, 2);
+  c32(0x5c);
+  eq();
+  byteAt(L.q, 3);
+  c32(0x6e);
+  eq();
+  and();
+  iff();
+  inc(L.q, 4);
+  inc(L.ln, 1);
+  c32(LINE_BREAK);
+  set(L.ended);
+  br(3); // $udone
+  end();
+  pushErr(STRAY);
+  inc(L.q, 2);
+  br(1); // $ul
+  end();
+  get(L.x);
+  c32(0x75);
+  eq();
+  iff();
+  uEscape();
+  br(1);
+  end();
+  put(0, 0x5c);
+  putLocal(1, L.x);
+  inc(L.w, 2);
+  inc(L.q, 2);
+  br(0);
+  end(); // $ul
+  end(); // $udone
+  get(L.junk);
+  get(L.w);
+  get(L.w0);
+  gtS();
+  and();
+  iff();
+  pushErr(JUNK);
+  end();
+  end(); // unquoted scan
+  get(L.count);
+  op(0x45);
+  iff();
+  get(L.w);
+  get(L.fs);
+  eq();
+  set(L.firstEmpty);
+  end();
+  put(0, 0x22);
+  inc(L.w, 1);
+  inc(L.count, 1);
+  get(L.ended);
+  c32(COMMA);
+  eq();
+  brIf(0); // $F
+  end(); // $F
+  // a line of stray CRs only: no record
+  get(L.count);
+  c32(1);
+  eq();
+  get(L.quoted);
+  op(0x45);
+  and();
+  get(L.firstEmpty);
+  and();
+  iff();
+  get(L.recO);
+  set(L.w);
+  br(1); // $R
+  end();
+  get(L.nrec);
+  op(0x45);
+  iff(); // first record
+  put(0, 0x5d);
+  inc(L.w, 1);
+  get(L.w);
+  gset(W_R0);
+  inc(L.w, 9);
+  get(L.count);
+  set(L.width);
+  c32(1);
+  set(L.nrec);
+  br(1); // $R
+  end();
+  get(L.count);
+  get(L.width);
+  ltS();
+  iff(); // short
+  pushErr(SHORT, L.count);
+  get(L.count);
+  set(L.k);
+  blk();
+  lp();
+  get(L.k);
+  get(L.width);
+  geS();
+  brIf(1);
+  put(0, 0x2c);
+  put(1, 0x22);
+  put(2, 0x22);
+  inc(L.w, 3);
+  inc(L.k, 1);
+  br(0);
+  end();
+  end();
+  els();
+  get(L.count);
+  get(L.width);
+  gtS();
+  iff(); // long
+  get(L.w);
+  get(L.cut);
+  c32(1);
+  add();
+  sub();
+  set(L.len);
+  get(L.xl);
+  get(L.len);
+  add();
+  get(P_XEND);
+  gtS();
+  iff();
+  c32(-2);
+  ret();
+  end();
+  get(L.xl);
+  get(L.cut);
+  c32(1);
+  add();
+  get(L.len);
+  op(0xfc, ...u(10), 0x00, 0x00); // memory.copy
+  get(L.xl);
+  get(L.xl);
+  get(L.len);
+  add();
+  set(L.k);
+  set(L.n);
+  pushErr(LONG, L.n, L.k);
+  get(L.k);
+  set(L.xl);
+  get(L.cut);
+  set(L.w);
+  end();
+  end();
+  put(0, 0x5d);
+  inc(L.w, 1);
+  inc(L.nrec, 1);
+  br(0); // $R
+  end(); // $R
+  end(); // $done
+  get(L.w);
+  gset(W_OUT);
+  get(L.nrec);
+  gset(W_NREC);
+  get(L.e);
+  gset(W_ERR);
+  get(L.xl);
+  gset(W_X);
+  get(L.q);
+  end(); // function
+
+  // ---- module ----
+  const vec = (items) => [...u(items.length), ...items.flat()];
+  const section = (id, bytes) => [id, ...u(bytes.length), ...bytes];
+  const str = (t) => [...u(t.length), ...Buffer.from(t, 'latin1')];
+  const typeSec = section(1, vec([[0x60, ...vec([I32, I32, I32, I32, I32, I32]), ...vec([I32])]]));
+  const importSec = section(2, vec([[...str('env'), ...str('mem'), 0x02, 0x00, ...u(1)]]));
+  const funcSec = section(3, vec([[0x00]]));
+  const globalSec = section(6, vec([0, 1, 2, 3, 4].map(() => [I32, 0x01, 0x41, 0x00, 0x0b])));
+  const exportSec = section(
+    7,
+    vec([[...str('text'), 0x00, 0x00], ...['out', 'r0', 'nrec', 'err', 'x'].map((nm, i) => [...str(nm), 0x03, i])]),
+  );
+  const locals = vec([
+    [...u(names.length), I32],
+    [...u(4), V128],
+  ]);
+  const body = [...locals, ...code];
+  const codeSec = section(10, vec([[...u(body.length), ...body]]));
+  return new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, ...typeSec, ...importSec, ...funcSec,
+    ...globalSec, ...exportSec, ...codeSec]);
+}
+
+let WX = null; // the instance's exports, while answerCases reads from WebAssembly memory
+let WMEM = null;
+let ERRB = 0; // where the error records start in memory
+let XB = 0; // where the extra fields start
+let OUTB = 0; // where the output starts
+let MEMEND = 0;
+
+/**
+ * Reads cases.json at `path` straight into WebAssembly memory and writes answers.json to `fd`, using the WebAssembly
+ * record loop (and the JavaScript reader for any case it hands back). Throws if WebAssembly SIMD is not available.
+ */
+export function answerFile(path, fd) {
+  const inFd = openSync(path, 'r');
+  const n = fstatSync(inFd).size;
+  const errCap = 1 << 22;
+  const xCap = 1 << 22;
+  const outCap = 3 * n + (1 << 20);
+  const align = (v) => (v + 15) & ~15;
+  ERRB = align(n + 64);
+  XB = ERRB + errCap;
+  OUTB = XB + xCap;
+  MEMEND = OUTB + outCap;
+  const mem = new WebAssembly.Memory({ initial: Math.ceil(MEMEND / 65536) + 1 });
+  const inst = new WebAssembly.Instance(new WebAssembly.Module(wasmText()), { env: { mem } });
+  WX = inst.exports;
+  WMEM = mem;
+  const all = Buffer.from(mem.buffer);
+  let got = 0;
+  while (got < n) {
+    const r = readSync(inFd, all, got, n - got, got);
+    if (r <= 0) break;
+    got += r;
+  }
+  closeSync(inFd);
+  all.fill(0x20, n, n + 64);
+  try {
+    answerCases(all.subarray(0, n), fd, all);
+  } finally {
+    WX = null;
+    WMEM = null;
+  }
 }
