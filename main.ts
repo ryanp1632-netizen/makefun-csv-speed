@@ -7,10 +7,10 @@ import { closeSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 
-// V8 flags, set before solve.js is imported: incremental marking off (as the house driver runs), and no TurboFan: the
-// work is one hot loop per case, and Maglev's code arrives sooner and costs less to compile than TurboFan's saves on a
-// ~10 MB input. Background GC tasks off, as the sandbox has one CPU.
-setFlagsFromString('--no-incremental-marking --no-turbofan --single-threaded-gc');
+// V8 flags, set before solve.js is imported: incremental marking off (as the house driver runs) and background GC tasks
+// off, as the sandbox has one CPU. (TurboFan stays on: the grader's Node 22 may have no Maglev, and without both
+// optimizing tiers the byte loop would run in the interpreter.)
+setFlagsFromString('--no-incremental-marking --single-threaded-gc');
 
 const { run, answerCases, warmUp } = (await import(new URL('./solve.js', import.meta.url).href)) as {
   run: (input: unknown) => unknown;
