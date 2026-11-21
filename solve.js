@@ -420,9 +420,13 @@ function readRecord() {
         q += 2;
         let closed = false;
         for (;;) {
-          const c = b[q];
+          let c = b[q];
+          while (c !== QT && c !== BS) {
+            out[w++] = c;
+            c = b[++q];
+          }
           if (c === QT) break;
-          if (c === BS) {
+          {
             const x = b[q + 1];
             if (x === QT) {
               if (b[q + 2] === BS && b[q + 3] === QT) {
@@ -465,10 +469,7 @@ function readRecord() {
             out[w++] = BS;
             out[w++] = x;
             q += 2;
-            continue;
           }
-          out[w++] = c;
-          q++;
         }
         if (!closed) {
           // The quote never closes: a literal character, and the text after it is read again as unquoted.
@@ -508,14 +509,18 @@ function readRecord() {
         const w0 = w;
         ended = END;
         for (;;) {
-          const c = b[q];
+          let c = b[q];
+          while (c !== CM && c !== QT && c !== BS) {
+            out[w++] = c;
+            c = b[++q];
+          }
           if (c === CM) {
             q++;
             ended = COMMA;
             break;
           }
           if (c === QT) break;
-          if (c === BS) {
+          {
             const x = b[q + 1];
             if (x === LN) {
               q += 2;
@@ -549,10 +554,7 @@ function readRecord() {
             out[w++] = BS;
             out[w++] = x;
             q += 2;
-            continue;
           }
-          out[w++] = c;
-          q++;
         }
         if (junk && w > w0) pushErr(JUNK, 0, 0);
       }
